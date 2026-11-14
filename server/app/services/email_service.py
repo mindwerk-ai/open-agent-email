@@ -50,6 +50,31 @@ SMTP_ACCEPTANCE_UNKNOWN = "SMTP relay connection ended during message submission
 # Stop starting new recipients after this long so one dispatch stays well inside the worker's
 # 300 s lease; the remaining recipients stay pending for the next attempt.
 DISPATCH_BUDGET_SECONDS = 120
+# Amazon SES answers the end of DATA with "250 Ok <ses-message-id>" and replaces the Message-ID header with
+# "<ses-message-id@REGION.amazonses.com>", one id per SMTP transaction. Replies therefore reference that id.
+# ponytail: exact current SES id shape only; other relays keep our own Message-ID and need no alias.
+SES_DATA_REPLY = re.compile(
+    r"Ok <?([0-9a-f]{16}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[0-9]{6})"
+    r"(?:@[A-Za-z0-9.-]+)?>?", re.IGNORECASE)
+REFERENCE_ID = re.compile(r"<([^<>@\s]+)@([^<>\s]+)>")
+
+
+def ses_message_id(data_reply: Optional[str]) -> Optional[str]:
+    """The SES message id from the server's reply to DATA, or None for any other relay/reply."""
+    match = SES_DATA_REPLY.fullmatch(str(data_reply or "").strip())
+    return match.group(1).lower() if match else None
+
+
+def ses_reference_ids(header_ids: List[str]) -> List[str]:
+    """SES message ids referenced as <id@...amazonses.com> in In-Reply-To/References tokens."""
+    found = []
+    for token in header_ids:
+        for local, domain in REFERENCE_ID.findall(token):
+            domain = domain.lower()
+            if domain == "amazonses.com" or domain.endswith(".amazonses.com"):
+                found.append(local.lower())
+    return found
+
 
 def _send_smtp_sync(
     host: str,
@@ -74,11 +99,15 @@ def _send_smtp_sync(
     ses_configuration_set: Optional[str] = None,
     cc_addr: Optional[str] = None,
     rcpt_to: Optional[str] = None,
+    relay_reply: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str]:
     """Submit one SMTP transaction.
 
     ``to_addr``/``cc_addr`` are the visible header values; ``rcpt_to`` is the single envelope recipient
     (defaults to ``to_addr``). Bcc recipients are only ever passed as ``rcpt_to``, never in a header.
+    When ``relay_reply`` is a dict, an accepted submission stores the relay's reply to DATA under
+    ``"data"`` and, for Amazon SES, the id it assigned under ``"ses_message_id"``. This is only
+    recorded information: it never changes the returned acceptance result.
     """
     submission_started = False
     try:
@@ -165,6 +194,15 @@ def _send_smtp_sync(
                 except Exception:
                     pass
                 return False, f"Configured DKIM signing failed: {type(exc).__name__}"
+        data_replies = []
+        send_data = getattr(server, "data", None)
+        if callable(send_data):
+            # smtplib.sendmail discards the reply to DATA, which carries the relay's own message id.
+            def data_capturing_reply(payload):
+                reply = send_data(payload)
+                data_replies.append(reply)
+                return reply
+            server.data = data_capturing_reply
         submission_started = True
         refused = server.sendmail(from_addr, [rcpt_to or to_addr], message_data)
         try:
@@ -175,6 +213,14 @@ def _send_smtp_sync(
         if refused:
             refusal_codes = [str(response[0]) for response in refused.values() if response]
             return False, f"SMTP relay refused the recipient (code {refusal_codes[0] if refusal_codes else 'unknown'})"
+        if relay_reply is not None:
+            try:
+                reply = data_replies[-1][1] if data_replies else None
+                relay_reply["data"] = reply.decode("ascii", "replace") if isinstance(reply, bytes) else reply
+                relay_reply["ses_message_id"] = ses_message_id(relay_reply["data"])
+            except Exception:
+                # Acceptance is already certain; a malformed reply only loses the id.
+                logger.exception("Relay accepted the message but its DATA reply could not be read")
         return True, "Accepted by upstream SMTP relay"
     except smtplib.SMTPRecipientsRefused as e:
         # A definitive RCPT refusal: the relay did not take the message for this recipient.
@@ -430,6 +476,7 @@ class EmailService:
             row.status, row.detail = "sending", None
             row.attempts += 1
             await db.commit()
+            relay_reply: Dict[str, Any] = {}
             success, info = await asyncio.to_thread(
                 _send_smtp_sync,
                 **relay,
@@ -447,7 +494,14 @@ class EmailService:
                 feedback_correlation_id=message.id if settings.SES_FEEDBACK_TOPIC_ARN.strip() else None,
                 ses_configuration_set=settings.SES_CONFIGURATION_SET.strip() or None,
                 attachments=attachments,
+                relay_reply=relay_reply,
             )
+            if success:
+                row.relay_message_id = relay_reply.get("ses_message_id")
+                if not row.relay_message_id:
+                    # Normal for relays that keep our Message-ID; with SES a reply may then open a new thread.
+                    logger.info("Relay accepted %s for one recipient without an SES message id (reply: %.80r)",
+                                message.id, relay_reply.get("data"))
             row.status = (
                 "accepted_by_relay" if success
                 else "delivery_unknown" if info == SMTP_ACCEPTANCE_UNKNOWN
@@ -573,6 +627,23 @@ class EmailService:
                 .limit(1)
             )
         parent_message = parent_query.scalar_one_or_none() if parent_query else None
+        ses_ids = ses_reference_ids(reference_ids) if parent_message is None else []
+        if ses_ids:
+            # Amazon SES gave each recipient copy of our outbound mail its own Message-ID; replies
+            # reference that id. Only this inbox's own outbound messages are considered.
+            parent_message = (await db.execute(
+                select(Message)
+                .join(MessageRecipient, MessageRecipient.message_id == Message.id)
+                .where(
+                    Message.agent_email == agent.email,
+                    Message.tenant_id == agent.tenant_id,
+                    Message.direction == "outbound",
+                    MessageRecipient.tenant_id == agent.tenant_id,
+                    MessageRecipient.relay_message_id.in_(ses_ids),
+                )
+                .order_by(Message.created_at.desc())
+                .limit(1)
+            )).scalar_one_or_none()
         thread_id = parent_message.thread_id if parent_message else f"th_{uuid.uuid4().hex[:12]}"
 
         review_item = None
